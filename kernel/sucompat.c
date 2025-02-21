@@ -8,7 +8,11 @@
 #include <linux/types.h>
 #include <linux/uaccess.h>
 #include <linux/version.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
 #include <linux/sched/task_stack.h>
+#else
+#include <linux/sched.h>
+#endif
 
 #include "objsec.h"
 #include "allowlist.h"
@@ -180,7 +184,12 @@ int ksu_handle_devpts(struct inode *inode)
 		return 0;
 
 	if (ksu_devpts_sid) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)
 		struct inode_security_struct *sec = selinux_inode(inode);
+#else
+		struct inode_security_struct *sec =
+			(struct inode_security_struct *)inode->i_security;
+#endif
 		if (sec) {
 			sec->sid = ksu_devpts_sid;
 		}
@@ -191,7 +200,19 @@ int ksu_handle_devpts(struct inode *inode)
 
 #ifdef CONFIG_KPROBES
 
-static int faccessat_handler_pre(struct kprobe *p, struct pt_regs *regs)
+__maybe_unused static int faccessat_handler_pre(struct kprobe *p,
+						struct pt_regs *regs)
+{
+	int *dfd = (int *)&PT_REGS_PARM1(regs);
+	const char __user **filename_user = (const char **)&PT_REGS_PARM2(regs);
+	int *mode = (int *)&PT_REGS_PARM3(regs);
+	// Both sys_ and do_ is C function
+	int *flags = (int *)&PT_REGS_CCALL_PARM4(regs);
+
+	return ksu_handle_faccessat(dfd, filename_user, mode, flags);
+}
+
+static int sys_faccessat_handler_pre(struct kprobe *p, struct pt_regs *regs)
 {
 	struct pt_regs *real_regs = PT_REAL_REGS(regs);
 	int *dfd = (int *)&PT_REGS_PARM1(real_regs);
@@ -202,18 +223,43 @@ static int faccessat_handler_pre(struct kprobe *p, struct pt_regs *regs)
 	return ksu_handle_faccessat(dfd, filename_user, mode, NULL);
 }
 
-static int newfstatat_handler_pre(struct kprobe *p, struct pt_regs *regs)
+__maybe_unused static int newfstatat_handler_pre(struct kprobe *p,
+						 struct pt_regs *regs)
+{
+	int *dfd = (int *)&PT_REGS_PARM1(regs);
+	const char __user **filename_user = (const char **)&PT_REGS_PARM2(regs);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
+	// static int vfs_statx(int dfd, const char __user *filename, int flags, struct kstat *stat, u32 request_mask)
+	int *flags = (int *)&PT_REGS_PARM3(regs);
+#else
+	// int vfs_fstatat(int dfd, const char __user *filename, struct kstat *stat,int flag)
+	int *flags = (int *)&PT_REGS_CCALL_PARM4(regs);
+#endif
+
+	return ksu_handle_stat(dfd, filename_user, flags);
+}
+
+static int sys_newfstatat_handler_pre(struct kprobe *p, struct pt_regs *regs)
 {
 	struct pt_regs *real_regs = PT_REAL_REGS(regs);
 	int *dfd = (int *)&PT_REGS_PARM1(real_regs);
-	const char __user **filename_user =
-		(const char **)&PT_REGS_PARM2(real_regs);
+	const char __user **filename_user = (const char **)&PT_REGS_PARM2(real_regs);
 	int *flags = (int *)&PT_REGS_SYSCALL_PARM4(real_regs);
 
 	return ksu_handle_stat(dfd, filename_user, flags);
 }
 
+// https://elixir.bootlin.com/linux/v5.10.158/source/fs/exec.c#L1864
 static int execve_handler_pre(struct kprobe *p, struct pt_regs *regs)
+{
+	int *fd = (int *)&PT_REGS_PARM1(regs);
+	struct filename **filename_ptr =
+		(struct filename **)&PT_REGS_PARM2(regs);
+
+	return ksu_handle_execveat_sucompat(fd, filename_ptr, NULL, NULL, NULL);
+}
+
+static int sys_execve_handler_pre(struct kprobe *p, struct pt_regs *regs)
 {
 	struct pt_regs *real_regs = PT_REAL_REGS(regs);
 	const char __user **filename_user =
@@ -226,8 +272,12 @@ static int execve_handler_pre(struct kprobe *p, struct pt_regs *regs)
 static int pts_unix98_lookup_pre(struct kprobe *p, struct pt_regs *regs)
 {
 	struct inode *inode;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 6, 0)
 	struct file *file = (struct file *)PT_REGS_PARM2(regs);
 	inode = file->f_path.dentry->d_inode;
+#else
+	inode = (struct inode *)PT_REGS_PARM2(regs);
+#endif
 
 	return ksu_handle_devpts(inode);
 }
@@ -266,16 +316,49 @@ static void destroy_kprobe(struct kprobe **kp_ptr)
 
 static struct kprobe *su_kps[4];
 
-// sucompat: permited process can execute 'su' to gain root access.
+// sucompat: permitted process can execute 'su' to gain root access.
 void ksu_sucompat_init()
 {
 #ifdef CONFIG_KPROBES
-	su_kps[0] = init_kprobe(SYS_EXECVE_SYMBOL, execve_handler_pre);
-	su_kps[1] = init_kprobe(SYS_FACCESSAT_SYMBOL, faccessat_handler_pre);
-	su_kps[2] = init_kprobe(SYS_NEWFSTATAT_SYMBOL, newfstatat_handler_pre);
-	su_kps[3] = init_kprobe("pts_unix98_lookup", pts_unix98_lookup_pre);
+
+    #if 1
+        su_kps[0] = init_kprobe(SYS_FACCESSAT_SYMBOL, sys_faccessat_handler_pre);
+    #else
+        #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 17, 0)
+            su_kps[0] = init_kprobe("do_faccessat", faccessat_handler_pre);
+        #else
+            su_kps[0] = init_kprobe("sys_faccessat", faccessat_handler_pre);
+        #endif
+    #endif
+
+    #if 1
+        su_kps[1] = init_kprobe(SYS_NEWFSTATAT_SYMBOL, sys_newfstatat_handler_pre);
+    #else
+        #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
+            su_kps[1] = init_kprobe("vfs_statx", newfstatat_handler_pre);
+        #else
+            su_kps[1] = init_kprobe("vfs_fstatat", newfstatat_handler_pre);
+        #endif
+    #endif
+
+    #if 1
+        su_kps[2] = init_kprobe(SYS_EXECVE_SYMBOL, sys_execve_handler_pre);
+    #else
+        #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
+            su_kps[2] = init_kprobe("do_execveat_common", execve_handler_pre);
+        #elif LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 0)
+            su_kps[2] = init_kprobe("__do_execve_file", execve_handler_pre);
+        #elif LINUX_VERSION_CODE >= KERNEL_VERSION(3, 19, 0)
+            su_kps[2] = init_kprobe("do_execveat_common", execve_handler_pre);
+        #endif
+    #endif
+
+    #if 1
+        su_kps[3] = init_kprobe("pts_unix98_lookup", pts_unix98_lookup_pre);
+    #endif
 #endif
 }
+
 
 void ksu_sucompat_exit()
 {
