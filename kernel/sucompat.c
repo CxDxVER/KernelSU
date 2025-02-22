@@ -70,6 +70,31 @@ int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode,
 	return 0;
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0) && defined(CONFIG_KSU_SUSFS_SUS_SU)
+struct filename* susfs_ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags) {
+	// const char sh[] = SH_PATH;
+	const char su[] = SU_PATH;
+	struct filename *name = getname_flags(*filename_user, getname_statx_lookup_flags(*flags), NULL);
+
+	if (unlikely(IS_ERR(name) || name->name == NULL)) {
+		return name;
+	}
+
+	if (!ksu_is_allow_uid(current_uid().val)) {
+		return name;
+	}
+
+	if (likely(memcmp(name->name, su, sizeof(su)))) {
+		return name;
+	}
+
+	const char sh[] = SH_PATH;
+	pr_info("vfs_fstatat su->sh!\n");
+	memcpy((void *)name->name, sh, sizeof(sh));
+	return name;
+}
+#endif
+
 int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags)
 {
 	// const char sh[] = SH_PATH;
@@ -243,7 +268,8 @@ static int sys_newfstatat_handler_pre(struct kprobe *p, struct pt_regs *regs)
 {
 	struct pt_regs *real_regs = PT_REAL_REGS(regs);
 	int *dfd = (int *)&PT_REGS_PARM1(real_regs);
-	const char __user **filename_user = (const char **)&PT_REGS_PARM2(real_regs);
+	const char __user **filename_user =
+		(const char **)&PT_REGS_PARM2(real_regs);
 	int *flags = (int *)&PT_REGS_SYSCALL_PARM4(real_regs);
 
 	return ksu_handle_stat(dfd, filename_user, flags);
@@ -269,6 +295,56 @@ static int sys_execve_handler_pre(struct kprobe *p, struct pt_regs *regs)
 					  NULL);
 }
 
+#if 1
+static struct kprobe faccessat_kp = {
+	.symbol_name = SYS_FACCESSAT_SYMBOL,
+	.pre_handler = sys_faccessat_handler_pre,
+};
+#else
+static struct kprobe faccessat_kp = {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 17, 0)
+	.symbol_name = "do_faccessat",
+#else
+	.symbol_name = "sys_faccessat",
+#endif
+	.pre_handler = faccessat_handler_pre,
+};
+#endif
+
+#if 1
+static struct kprobe newfstatat_kp = {
+	.symbol_name = SYS_NEWFSTATAT_SYMBOL,
+	.pre_handler = sys_newfstatat_handler_pre,
+};
+#else
+static struct kprobe newfstatat_kp = {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
+	.symbol_name = "vfs_statx",
+#else
+	.symbol_name = "vfs_fstatat",
+#endif
+	.pre_handler = newfstatat_handler_pre,
+};
+#endif
+
+#if 1
+static struct kprobe execve_kp = {
+	.symbol_name = SYS_EXECVE_SYMBOL,
+	.pre_handler = sys_execve_handler_pre,
+};
+#else
+static struct kprobe execve_kp = {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
+	.symbol_name = "do_execveat_common",
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 0)
+	.symbol_name = "__do_execve_file",
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(3, 19, 0)
+	.symbol_name = "do_execveat_common",
+#endif
+	.pre_handler = execve_handler_pre,
+};
+#endif
+
 static int pts_unix98_lookup_pre(struct kprobe *p, struct pt_regs *regs)
 {
 	struct inode *inode;
@@ -282,90 +358,56 @@ static int pts_unix98_lookup_pre(struct kprobe *p, struct pt_regs *regs)
 	return ksu_handle_devpts(inode);
 }
 
+static struct kprobe pts_unix98_lookup_kp = { .symbol_name =
+						      "pts_unix98_lookup",
+					      .pre_handler =
+						      pts_unix98_lookup_pre };
+
 #endif
 
-static struct kprobe *init_kprobe(const char *name,
-				  kprobe_pre_handler_t handler)
-{
-	struct kprobe *kp = kzalloc(sizeof(struct kprobe), GFP_KERNEL);
-	if (!kp)
-		return NULL;
-	kp->symbol_name = name;
-	kp->pre_handler = handler;
-
-	int ret = register_kprobe(kp);
-	pr_info("sucompat: register_%s kprobe: %d\n", name, ret);
-	if (ret) {
-		kfree(kp);
-		return NULL;
-	}
-
-	return kp;
-}
-
-static void destroy_kprobe(struct kprobe **kp_ptr)
-{
-	struct kprobe *kp = *kp_ptr;
-	if (!kp)
-		return;
-	unregister_kprobe(kp);
-	synchronize_rcu();
-	kfree(kp);
-	*kp_ptr = NULL;
-}
-
-static struct kprobe *su_kps[4];
-
-// sucompat: permitted process can execute 'su' to gain root access.
+// sucompat: permited process can execute 'su' to gain root access.
 void ksu_sucompat_init()
 {
 #ifdef CONFIG_KPROBES
-
-    #if 1
-        su_kps[0] = init_kprobe(SYS_FACCESSAT_SYMBOL, sys_faccessat_handler_pre);
-    #else
-        #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 17, 0)
-            su_kps[0] = init_kprobe("do_faccessat", faccessat_handler_pre);
-        #else
-            su_kps[0] = init_kprobe("sys_faccessat", faccessat_handler_pre);
-        #endif
-    #endif
-
-    #if 1
-        su_kps[1] = init_kprobe(SYS_NEWFSTATAT_SYMBOL, sys_newfstatat_handler_pre);
-    #else
-        #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
-            su_kps[1] = init_kprobe("vfs_statx", newfstatat_handler_pre);
-        #else
-            su_kps[1] = init_kprobe("vfs_fstatat", newfstatat_handler_pre);
-        #endif
-    #endif
-
-    #if 1
-        su_kps[2] = init_kprobe(SYS_EXECVE_SYMBOL, sys_execve_handler_pre);
-    #else
-        #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
-            su_kps[2] = init_kprobe("do_execveat_common", execve_handler_pre);
-        #elif LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 0)
-            su_kps[2] = init_kprobe("__do_execve_file", execve_handler_pre);
-        #elif LINUX_VERSION_CODE >= KERNEL_VERSION(3, 19, 0)
-            su_kps[2] = init_kprobe("do_execveat_common", execve_handler_pre);
-        #endif
-    #endif
-
-    #if 1
-        su_kps[3] = init_kprobe("pts_unix98_lookup", pts_unix98_lookup_pre);
-    #endif
+	int ret;
+	ret = register_kprobe(&execve_kp);
+	pr_info("sucompat: execve_kp: %d\n", ret);
+	ret = register_kprobe(&newfstatat_kp);
+	pr_info("sucompat: newfstatat_kp: %d\n", ret);
+	ret = register_kprobe(&faccessat_kp);
+	pr_info("sucompat: faccessat_kp: %d\n", ret);
+	ret = register_kprobe(&pts_unix98_lookup_kp);
+	pr_info("sucompat: devpts_kp: %d\n", ret);
 #endif
 }
-
 
 void ksu_sucompat_exit()
 {
 #ifdef CONFIG_KPROBES
-	for (int i = 0; i < ARRAY_SIZE(su_kps); i++) {
-		destroy_kprobe(&su_kps[i]);
-	}
+	unregister_kprobe(&execve_kp);
+	unregister_kprobe(&newfstatat_kp);
+	unregister_kprobe(&faccessat_kp);
+	unregister_kprobe(&pts_unix98_lookup_kp);
 #endif
 }
+
+#ifdef CONFIG_KSU_SUSFS_SUS_SU
+extern bool ksu_devpts_hook;
+
+void ksu_susfs_disable_sus_su(void) {
+	enable_kprobe(&execve_kp);
+	enable_kprobe(&newfstatat_kp);
+	enable_kprobe(&faccessat_kp);
+	enable_kprobe(&pts_unix98_lookup_kp);
+	ksu_devpts_hook = false;
+}
+
+void ksu_susfs_enable_sus_su(void) {
+	disable_kprobe(&execve_kp);
+	disable_kprobe(&newfstatat_kp);
+	disable_kprobe(&faccessat_kp);
+	disable_kprobe(&pts_unix98_lookup_kp);
+	ksu_devpts_hook = true;
+}
+#endif // #ifdef CONFIG_KSU_SUSFS_SUS_SU
 
